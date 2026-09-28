@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: verification-bot
+    env: docker
+    plan: free
+    dockerfilePath: Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: BOT_USERNAME
+        sync: false
+      - key: MONGODB_URI
+        sync: false
+      - key: OWNER_ID
+        sync: false
+      - key: MONGO_DB_NAME
+        value: afk_db
+      - key: AUTO_BAN_HIGH_RISK
+        value: "true"
+      - key: TRUST_PROXY_HEADERS
+        value: "true"

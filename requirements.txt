@@ -1,0 +1,5 @@
+pyrogram==2.0.106
+motor==3.1.2
+pymongo==4.3.3
+TgCrypto==1.2.5
+flask>=3.0,<4
