@@ -484,4 +484,8 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Pyrogram binds its Client to the event loop that exists when the Client
+    # is created. asyncio.run() creates a different loop, which can cause
+    # "Future attached to a different loop" during handler shutdown.
+    # Run main() through Pyrogram so start/handlers/idle/stop share one loop.
+    bot.run(main())
