@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import html
 import asyncio
 import logging
 import threading
@@ -695,14 +696,16 @@ async def guard_unverified_group_member(_, message: Message):
     if not deep_link:
         logger.warning("BOT_USERNAME unavailable; cannot create private deep-link verification prompt.")
         return
-    name = message.from_user.first_name or "User"
+    name = html.escape(message.from_user.first_name or "User")
+    user_mention = f'<a href="tg://user?id={uid}">{name}</a>'
     prompt_msg = await message.reply_text(
-        f"🔐 **Verification Required for {name}**\n\n"
+        f"🔐 <b>Verification Required for {user_mention}</b>\n\n"
         "You must complete verification before you can send messages in this group.\n"
         "Tap the button below to continue in private chat.",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ Verify in Private Chat", url=deep_link)
         ]]),
+        parse_mode=enums.ParseMode.HTML,
     )
     # Save the verification prompt so it can be removed automatically after
     # successful verification/manual approval, keeping the group clean.
