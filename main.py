@@ -134,22 +134,32 @@ async def mute_unverified_member(group_id: int, user_id: int) -> bool:
 
 
 async def fully_unmute_member(group_id: int, user_id: int) -> bool:
-    """Restore the group's normal member permissions after successful verification."""
+    """Fully restore a verified member's ordinary group permissions.
+
+    Do not copy the group's current default permissions here: if any default
+    flag is false, that can leave a previously-muted member partially
+    restricted. Instead explicitly clear the member-level restriction by
+    granting every non-admin permission exposed by Pyrogram 2.x.
+    """
     try:
-        chat = await bot.get_chat(int(group_id))
-        permissions = getattr(chat, "permissions", None)
-        if permissions is None:
-            permissions = ChatPermissions(
-                can_send_messages=True,
-                can_send_media_messages=True,
-                can_send_polls=True,
-                can_send_other_messages=True,
-                can_add_web_page_previews=True,
-            )
-        await bot.restrict_chat_member(int(group_id), int(user_id), permissions=permissions)
+        permissions = ChatPermissions(
+            can_send_messages=True,
+            can_send_media_messages=True,
+            can_send_polls=True,
+            can_send_other_messages=True,
+            can_add_web_page_previews=True,
+            can_change_info=True,
+            can_invite_users=True,
+            can_pin_messages=True,
+        )
+        await bot.restrict_chat_member(
+            int(group_id),
+            int(user_id),
+            permissions=permissions,
+        )
         return True
     except Exception as e:
-        logger.warning("Could not unmute verified member %s in %s: %s", user_id, group_id, e)
+        logger.warning("Could not fully unmute verified member %s in %s: %s", user_id, group_id, e)
         return False
 
 
@@ -535,18 +545,34 @@ async def on_join_request(_, join_request):
         return
 
     uid = int(join_request.from_user.id)
+    # Every NEW join request starts a fresh verification cycle. This is the
+    # only normal way an already-verified user becomes eligible to verify again.
     await verification_pending.update_one(
         {"group_id": gid, "user_id": uid},
-        {"$set": {
-            "group_id": gid,
-            "group_title": join_request.chat.title or group.get("title") or str(gid),
-            "user_id": uid,
-            "status": "pending",
-            "requested_at": datetime.now(),
-            "user_chat_id": int(getattr(join_request, "user_chat_id", 0) or 0) or None,
-            "reminder_attempted": False,
-            "reminder_sent": False,
-        }},
+        {
+            "$set": {
+                "group_id": gid,
+                "group_title": join_request.chat.title or group.get("title") or str(gid),
+                "user_id": uid,
+                "status": "pending",
+                "requested_at": datetime.now(),
+                "user_chat_id": int(getattr(join_request, "user_chat_id", 0) or 0) or None,
+                "reminder_attempted": False,
+                "reminder_sent": False,
+                "group_verify_prompt_sent": False,
+                "muted_unverified": False,
+            },
+            "$inc": {"verification_cycle": 1},
+            "$unset": {
+                "verified_at": "",
+                "verification_event_id": "",
+                "reviewed_at": "",
+                "reviewed_by": "",
+                "approval_error": "",
+                "unmuted_at": "",
+                "same_ip_user_ids": "",
+            },
+        },
         upsert=True,
     )
 
@@ -560,6 +586,60 @@ async def on_join_request(_, join_request):
         {"group_id": gid, "user_id": uid},
         {"$set": {"dm_sent": bool(sent), "dm_attempted_at": datetime.now()}},
     )
+
+
+@bot.on_chat_member_updated()
+async def track_member_leave(_, update):
+    """Invalidate a completed verification when the user leaves a protected group.
+
+    A future join request will create a fresh pending cycle and require verification again.
+    """
+    try:
+        gid = int(update.chat.id)
+        group = await verification_groups.find_one({"chat_id": gid, "enabled": {"$ne": False}})
+        if not group:
+            return
+
+        old_member = getattr(update, "old_chat_member", None)
+        new_member = getattr(update, "new_chat_member", None)
+        user = getattr(new_member, "user", None) or getattr(old_member, "user", None)
+        if not user or getattr(user, "is_bot", False):
+            return
+        uid = int(user.id)
+
+        old_status = getattr(old_member, "status", None)
+        new_status = getattr(new_member, "status", None)
+        active_statuses = {
+            enums.ChatMemberStatus.MEMBER,
+            enums.ChatMemberStatus.RESTRICTED,
+            enums.ChatMemberStatus.ADMINISTRATOR,
+            enums.ChatMemberStatus.OWNER,
+        }
+        left_statuses = {enums.ChatMemberStatus.LEFT, enums.ChatMemberStatus.BANNED}
+        if old_status not in active_statuses or new_status not in left_statuses:
+            return
+
+        pending = await verification_pending.find_one({"group_id": gid, "user_id": uid})
+        if not pending:
+            return
+        status = str(pending.get("status") or "")
+        # Preserve actual ban decisions; they are security records, not ordinary leaves.
+        if status.startswith("banned") or status.startswith("auto_banned"):
+            return
+        if status in VERIFIED_PENDING_STATUSES or status == "manual_review_ip":
+            await verification_pending.update_one(
+                {"_id": pending["_id"]},
+                {"$set": {
+                    "status": "left_requires_reverification",
+                    "left_at": datetime.now(),
+                    "group_verify_prompt_sent": False,
+                    "reminder_attempted": False,
+                    "reminder_sent": False,
+                }},
+            )
+            logger.info("Verification invalidated after leave: user=%s group=%s", uid, gid)
+    except Exception as e:
+        logger.debug("Could not process chat-member leave update: %s", e)
 
 
 @bot.on_message(filters.group & ~filters.service & ~filters.me)
@@ -616,13 +696,22 @@ async def guard_unverified_group_member(_, message: Message):
         logger.warning("BOT_USERNAME unavailable; cannot create private deep-link verification prompt.")
         return
     name = message.from_user.first_name or "User"
-    await message.reply_text(
+    prompt_msg = await message.reply_text(
         f"🔐 **Verification Required for {name}**\n\n"
         "You must complete verification before you can send messages in this group.\n"
         "Tap the button below to continue in private chat.",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ Verify in Private Chat", url=deep_link)
         ]]),
+    )
+    # Save the verification prompt so it can be removed automatically after
+    # successful verification/manual approval, keeping the group clean.
+    await verification_pending.update_one(
+        {"_id": pending["_id"]},
+        {"$set": {
+            "group_verify_prompt_message_id": int(prompt_msg.id),
+            "group_verify_prompt_chat_id": gid,
+        }},
     )
 
 
@@ -634,19 +723,44 @@ async def verify_cmd(_, message: Message):
     if not VERIFY_URL:
         await message.reply_text("❌ Verification URL is not configured yet.")
         return
+
+    uid = int(message.from_user.id)
     pending = await verification_pending.find_one(
-        {"user_id": int(message.from_user.id), "status": {"$in": ["pending", "manual_review_ip"]}},
+        {"user_id": uid},
         sort=[("requested_at", -1)],
     )
-    if pending:
-        gid = int(pending["group_id"])
-    else:
-        groups = await get_verification_groups()
-        if not groups:
-            await message.reply_text("❌ No verification group has been configured yet.")
-            return
-        gid = int(groups[0]["chat_id"])
+    if not pending:
+        await message.reply_text(
+            "ℹ️ You do not have an active verification request.\n\n"
+            "Send a join request to a protected group first."
+        )
+        return
+
+    status = str(pending.get("status") or "")
+    gid = int(pending["group_id"])
     name = await get_group_name(gid)
+
+    if status in VERIFIED_PENDING_STATUSES:
+        await fully_unmute_member(gid, uid)
+        await message.reply_text(
+            f"✅ You are already verified for **{name}**.\n\n"
+            "You only need to verify again after leaving the group and sending a new join request."
+        )
+        return
+
+    if status == "manual_review_ip":
+        await message.reply_text(
+            f"⏳ Your verification for **{name}** is already under administrator review.\n\n"
+            "You do not need to verify again."
+        )
+        return
+
+    if status != "pending":
+        await message.reply_text(
+            f"ℹ️ There is no active verification request for **{name}**.\n\n"
+            "Send a new join request to start verification again."
+        )
+        return
     await message.reply_text(
         "🔐 **Verification Required**\n\n"
         f"**Group:** {name}\n\n"
@@ -658,6 +772,29 @@ async def verify_cmd(_, message: Message):
             InlineKeyboardButton(f"✅ Verify for {name}"[:64], web_app=WebAppInfo(url=verification_url(gid)))
         ]]),
     )
+
+
+async def delete_group_verification_prompt(pending: dict) -> bool:
+    """Delete the one-off verification prompt posted in the group, if present."""
+    if not pending:
+        return False
+    gid = pending.get("group_verify_prompt_chat_id") or pending.get("group_id")
+    mid = pending.get("group_verify_prompt_message_id")
+    if not gid or not mid:
+        return False
+    try:
+        await bot.delete_messages(int(gid), int(mid))
+        await verification_pending.update_one(
+            {"_id": pending["_id"]},
+            {"$set": {
+                "group_verify_prompt_deleted": True,
+                "group_verify_prompt_deleted_at": datetime.now(),
+            }}
+        )
+        return True
+    except Exception as e:
+        logger.debug("Could not delete verification prompt %s in %s: %s", mid, gid, e)
+        return False
 
 
 @bot.on_callback_query(filters.regex(r"^vip(ok|ban):(-?\d+):(\d+)$"))
@@ -684,6 +821,7 @@ async def manual_ip_review(_, query: CallbackQuery):
             # The user may already have been admitted by another admin.
             logger.info("Join approval during same-IP review returned %s; attempting unmute in case user is already a member.", e)
         unmuted = await fully_unmute_member(gid, uid)
+        await delete_group_verification_prompt(pending)
         new_status = "approved_manual_ip_review"
         action_name = "manual_approve_same_ip"
         result_text = "✅ Manually approved after same-IP review." + (" User unmuted." if unmuted else "")

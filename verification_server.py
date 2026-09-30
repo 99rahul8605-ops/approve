@@ -128,6 +128,33 @@ def telegram_api(method: str, payload: Optional[dict] = None, timeout: int = 12)
 
     return body
 
+def delete_group_verification_prompt(group_id: int, user_id: int):
+    """Best-effort cleanup of the temporary group verification prompt."""
+    pending = verification_pending.find_one({
+        "group_id": int(group_id),
+        "user_id": int(user_id),
+    })
+    if not pending:
+        return {"ok": False, "description": "pending record not found"}
+    chat_id = pending.get("group_verify_prompt_chat_id") or pending.get("group_id")
+    message_id = pending.get("group_verify_prompt_message_id")
+    if not chat_id or not message_id:
+        return {"ok": False, "description": "no group verification prompt"}
+    result = telegram_api("deleteMessage", {
+        "chat_id": int(chat_id),
+        "message_id": int(message_id),
+    })
+    if result.get("ok"):
+        verification_pending.update_one(
+            {"_id": pending["_id"]},
+            {"$set": {
+                "group_verify_prompt_deleted": True,
+                "group_verify_prompt_deleted_at": datetime.now(timezone.utc),
+            }},
+        )
+    return result
+
+
 
 def get_chat_member(group_id: int, user_id: int):
     return telegram_api(
@@ -224,31 +251,28 @@ def decline_and_ban_user(group_id: int, user_id: int):
 
 
 def unmute_user_in_group(group_id: int, user_id: int):
-    """Restore the protected group's normal permissions after verification.
+    """Fully remove member-level restrictions after successful verification.
 
-    This also handles the case where another admin approved the join request
-    before verification and the bot muted the member on their first message.
+    Explicitly grant every ordinary ChatPermissions flag instead of copying
+    the group's defaults, because copying a false default can leave the user
+    partially muted even after verification.
     """
-    chat = telegram_api("getChat", {"chat_id": group_id})
-    permissions = {}
-    if chat.get("ok"):
-        permissions = (chat.get("result") or {}).get("permissions") or {}
-
-    # If Telegram does not expose group defaults, grant the normal send rights.
-    if not permissions:
-        permissions = {
-            "can_send_messages": True,
-            "can_send_audios": True,
-            "can_send_documents": True,
-            "can_send_photos": True,
-            "can_send_videos": True,
-            "can_send_video_notes": True,
-            "can_send_voice_notes": True,
-            "can_send_polls": True,
-            "can_send_other_messages": True,
-            "can_add_web_page_previews": True,
-            "can_invite_users": True,
-        }
+    permissions = {
+        "can_send_messages": True,
+        "can_send_audios": True,
+        "can_send_documents": True,
+        "can_send_photos": True,
+        "can_send_videos": True,
+        "can_send_video_notes": True,
+        "can_send_voice_notes": True,
+        "can_send_polls": True,
+        "can_send_other_messages": True,
+        "can_add_web_page_previews": True,
+        "can_change_info": True,
+        "can_invite_users": True,
+        "can_pin_messages": True,
+        "can_manage_topics": True,
+    }
 
     return telegram_api(
         "restrictChatMember",
@@ -256,6 +280,7 @@ def unmute_user_in_group(group_id: int, user_id: int):
             "chat_id": group_id,
             "user_id": user_id,
             "permissions": json.dumps(permissions, separators=(",", ":")),
+            "use_independent_chat_permissions": True,
         },
     )
 
@@ -783,6 +808,51 @@ def verify_api():
     telegram_user = init["user"]
     telegram_user_id = init["user_id"]
 
+    # One verification per active join cycle. Re-opening/re-clicking the same
+    # Web App must not create more verification events or rerun anti-fraud
+    # checks. A fresh join request resets this record back to `pending`.
+    pending_doc = verification_pending.find_one({
+        "group_id": target_group_id,
+        "user_id": telegram_user_id,
+    })
+    if not pending_doc:
+        return jsonify({
+            "ok": False,
+            "status": "no_active_request",
+            "group_name": get_group_title(target_group_id),
+            "message": "No active verification request was found. Please send a new join request first.",
+        }), 409
+
+    pending_status = str(pending_doc.get("status") or "")
+    if pending_status in {
+        "approved",
+        "approved_exception",
+        "approved_manual_ip_review",
+        "verified_waiting_approval",
+    }:
+        return jsonify({
+            "ok": True,
+            "status": "already_verified",
+            "group_name": get_group_title(target_group_id),
+            "message": "You are already verified for this group. Verification will be required again only after you leave and send a new join request.",
+        }), 200
+
+    if pending_status == "manual_review_ip":
+        return jsonify({
+            "ok": True,
+            "status": "manual_review",
+            "group_name": get_group_title(target_group_id),
+            "message": "Your verification is already under administrator review. Please wait for approval.",
+        }), 200
+
+    if pending_status != "pending":
+        return jsonify({
+            "ok": False,
+            "status": "no_active_request",
+            "group_name": get_group_title(target_group_id),
+            "message": "This verification request is no longer active. Please send a new join request to verify again.",
+        }), 409
+
     # Never trust telegram_user_id sent separately by browser.
     claimed_id = payload.get("telegram_user_id")
     try:
@@ -858,6 +928,8 @@ def verify_api():
         unmute_result = unmute_user_in_group(target_group_id, telegram_user_id)
         unmuted = bool(unmute_result.get("ok"))
         access_restored = approved or unmuted
+        if access_restored:
+            delete_group_verification_prompt(target_group_id, telegram_user_id)
 
         verification_actions.insert_one({
             "event_id": inserted.inserted_id,
@@ -1077,6 +1149,8 @@ def verify_api():
     unmute_result = unmute_user_in_group(target_group_id, telegram_user_id)
     unmuted = bool(unmute_result.get("ok"))
     access_restored = approved or unmuted
+    if access_restored:
+        delete_group_verification_prompt(target_group_id, telegram_user_id)
     verification_pending.update_one(
         {"group_id": target_group_id, "user_id": telegram_user_id},
         {"$set": {

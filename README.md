@@ -51,3 +51,11 @@ Normal users only see the user-facing verification help and `/verify` flow.
 If another group admin approves a join request before the requester verifies, the bot now catches the member on their first group message, mutes them, and posts a targeted **Verify in Private Chat** button. The deep-link is bound to that Telegram user ID, so another member cannot use it for themselves. After successful verification, the bot restores the group's normal member permissions automatically. The triggering unverified message is also deleted when the bot has permission to delete messages.
 
 For this feature, keep the bot as group admin with **Restrict Members** and **Delete Messages** permissions in addition to join-request approval rights.
+
+
+### Full unmute after verification
+After successful verification (or manual approval after IP review), the bot now explicitly grants all ordinary member permissions instead of copying potentially-restricted group defaults. This prevents users from remaining partially muted after verification.
+
+## One verification per join cycle
+
+A user can complete verification only once for the current active join request. Reopening the same verification page after success returns an “already verified” response and does not create another verification event. If the user leaves a protected group, the completed verification is invalidated; the next join request creates a fresh verification cycle and requires verification again.
