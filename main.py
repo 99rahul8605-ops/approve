@@ -29,6 +29,7 @@ MONGODB_URI = (os.getenv("MONGODB_URI") or "").strip()
 MONGO_DB_NAME = (os.getenv("MONGO_DB_NAME") or "afk_db").strip() or "afk_db"
 OWNER_ID = int((os.getenv("OWNER_ID") or "0").strip())
 VERIFY_URL = (os.getenv("VERIFY_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").strip().rstrip("/")
+VERIFICATION_REMINDER_SECONDS = int((os.getenv("VERIFICATION_REMINDER_SECONDS") or "240").strip())
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is required")
@@ -223,11 +224,12 @@ async def send_join_verification_dm(join_request, group_name: str, group_id: int
 
 
 async def send_verification_reminder(pending: dict) -> bool:
-    """Send one reminder about 5 minutes after a still-pending join request.
+    """Send one reminder while Telegram's temporary join-request DM is still valid.
 
-    We keep the temporary join-request chat id when Telegram provides it and
-    try that first, then fall back to the normal Telegram user id. Telegram
-    controls how long the temporary join-request DM channel remains usable.
+    Telegram only exposes the temporary requester chat for about five minutes.
+    The reminder loop therefore defaults to 240 seconds (4 minutes), leaving
+    enough margin for scheduler/network delay. The delay is configurable via
+    VERIFICATION_REMINDER_SECONDS.
     """
     user_id = int(pending.get("user_id") or 0)
     group_id = int(pending.get("group_id") or 0)
@@ -281,15 +283,18 @@ async def send_verification_reminder(pending: dict) -> bool:
         logger.info("Verification reminder sent to %s for group %s", user_id, group_id)
         return True
     except Exception as e:
-        logger.warning("Verification reminder fallback failed for %s: %s", user_id, e)
+        if "PEER_ID_INVALID" in str(e):
+            logger.info("Verification reminder fallback unavailable for %s (user has not opened the bot in PM yet).", user_id)
+        else:
+            logger.warning("Verification reminder fallback failed for %s: %s", user_id, e)
         return False
 
 
 async def verification_reminder_loop():
-    """Persistently send one reminder after 5 minutes for unverified requests."""
+    """Persistently send one reminder before the temporary DM window expires."""
     while True:
         try:
-            cutoff = datetime.now() - timedelta(minutes=5)
+            cutoff = datetime.now() - timedelta(seconds=VERIFICATION_REMINDER_SECONDS)
             cursor = verification_pending.find({
                 "status": "pending",
                 "requested_at": {"$lte": cutoff},
