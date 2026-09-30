@@ -6,11 +6,11 @@ import logging
 import threading
 import urllib.request
 import urllib.error
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from pyrogram import Client, filters, enums, idle
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, WebAppInfo
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, WebAppInfo, ChatPermissions
 from motor.motor_asyncio import AsyncIOMotorClient
 
 from verification_server import app as web_app, VERIFY_HOST, VERIFY_PORT
@@ -110,6 +110,55 @@ async def set_same_ip_autoban_enabled(enabled: bool):
     )
 
 
+VERIFIED_PENDING_STATUSES = {
+    "approved",
+    "approved_exception",
+    "approved_manual_ip_review",
+    "verified_waiting_approval",
+}
+
+
+async def mute_unverified_member(group_id: int, user_id: int) -> bool:
+    """Mute a member who entered a protected group before completing verification."""
+    try:
+        await bot.restrict_chat_member(
+            int(group_id),
+            int(user_id),
+            permissions=ChatPermissions(can_send_messages=False),
+        )
+        return True
+    except Exception as e:
+        logger.warning("Could not mute unverified member %s in %s: %s", user_id, group_id, e)
+        return False
+
+
+async def fully_unmute_member(group_id: int, user_id: int) -> bool:
+    """Restore the group's normal member permissions after successful verification."""
+    try:
+        chat = await bot.get_chat(int(group_id))
+        permissions = getattr(chat, "permissions", None)
+        if permissions is None:
+            permissions = ChatPermissions(
+                can_send_messages=True,
+                can_send_media_messages=True,
+                can_send_polls=True,
+                can_send_other_messages=True,
+                can_add_web_page_previews=True,
+            )
+        await bot.restrict_chat_member(int(group_id), int(user_id), permissions=permissions)
+        return True
+    except Exception as e:
+        logger.warning("Could not unmute verified member %s in %s: %s", user_id, group_id, e)
+        return False
+
+
+def bot_deep_link(group_id: int, user_id: int) -> str:
+    username = BOT_USERNAME.strip().lstrip("@")
+    if not username:
+        return ""
+    return f"https://t.me/{username}?start=verify_{int(group_id)}_{int(user_id)}"
+
+
 def target_user_id(message: Message) -> Optional[int]:
     if message.reply_to_message and message.reply_to_message.from_user:
         return int(message.reply_to_message.from_user.id)
@@ -173,6 +222,113 @@ async def send_join_verification_dm(join_request, group_name: str, group_id: int
         return False
 
 
+async def send_verification_reminder(pending: dict) -> bool:
+    """Send one reminder about 5 minutes after a still-pending join request.
+
+    We keep the temporary join-request chat id when Telegram provides it and
+    try that first, then fall back to the normal Telegram user id. Telegram
+    controls how long the temporary join-request DM channel remains usable.
+    """
+    user_id = int(pending.get("user_id") or 0)
+    group_id = int(pending.get("group_id") or 0)
+    user_chat_id = pending.get("user_chat_id")
+    if not user_id or not group_id or not VERIFY_URL:
+        return False
+
+    group_name = pending.get("group_title") or await get_group_name(group_id)
+    url = verification_url(group_id)
+    text = (
+        "⏰ Verification Reminder\n\n"
+        f"Group: {group_name}\n\n"
+        "You have not completed your verification yet.\n"
+        "Verification is compulsory to be approved in this group.\n\n"
+        "Tap the button below to verify now."
+    )
+    button_text = f"✅ Verify for {group_name}"[:64]
+
+    if user_chat_id:
+        payload = {
+            "chat_id": int(user_chat_id),
+            "text": text,
+            "reply_markup": {"inline_keyboard": [[{"text": button_text, "web_app": {"url": url}}]]},
+        }
+
+        def do_send():
+            req = urllib.request.Request(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return resp.status, resp.read().decode("utf-8", errors="replace")
+
+        try:
+            status, body = await asyncio.to_thread(do_send)
+            if 200 <= int(status) < 300:
+                logger.info("Verification reminder sent via temporary chat to %s for group %s", user_id, group_id)
+                return True
+            logger.warning("Verification reminder Bot API failed [%s]: %s", status, body)
+        except Exception as e:
+            logger.warning("Temporary reminder DM failed for %s: %s", user_id, e)
+
+    try:
+        await bot.send_message(
+            user_id,
+            text,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(button_text, web_app=WebAppInfo(url=url))]]),
+        )
+        logger.info("Verification reminder sent to %s for group %s", user_id, group_id)
+        return True
+    except Exception as e:
+        logger.warning("Verification reminder fallback failed for %s: %s", user_id, e)
+        return False
+
+
+async def verification_reminder_loop():
+    """Persistently send one reminder after 5 minutes for unverified requests."""
+    while True:
+        try:
+            cutoff = datetime.now() - timedelta(minutes=5)
+            cursor = verification_pending.find({
+                "status": "pending",
+                "requested_at": {"$lte": cutoff},
+                "reminder_attempted": {"$ne": True},
+            }).sort("requested_at", 1).limit(100)
+
+            async for pending in cursor:
+                # Claim the reminder atomically so multiple loop iterations or
+                # duplicate workers do not send it twice.
+                claim = await verification_pending.update_one(
+                    {
+                        "_id": pending["_id"],
+                        "status": "pending",
+                        "reminder_attempted": {"$ne": True},
+                    },
+                    {"$set": {
+                        "reminder_attempted": True,
+                        "reminder_attempted_at": datetime.now(),
+                    }},
+                )
+                if claim.modified_count == 0:
+                    continue
+
+                sent = await send_verification_reminder(pending)
+                await verification_pending.update_one(
+                    {"_id": pending["_id"]},
+                    {"$set": {
+                        "reminder_sent": bool(sent),
+                        "reminder_sent_at": datetime.now() if sent else None,
+                    }},
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.exception("Verification reminder loop error: %s", e)
+
+        await asyncio.sleep(15)
+
+
 def help_text(is_owner: bool) -> str:
     text = (
         "🔐 **Verification Bot**\n\n"
@@ -198,7 +354,34 @@ def help_text(is_owner: bool) -> str:
 
 @bot.on_message(filters.command("start"))
 async def start_cmd(_, message: Message):
-    await message.reply_text(help_text(owner_only(message.from_user.id if message.from_user else 0)))
+    uid = int(message.from_user.id if message.from_user else 0)
+    payload = message.command[1] if len(message.command) > 1 else ""
+    m = re.fullmatch(r"verify_(-?\d+)_(\d+)", payload or "")
+    if m:
+        gid, target_uid = int(m.group(1)), int(m.group(2))
+        if uid != target_uid:
+            await message.reply_text("❌ This verification link is not for your account.")
+            return
+        pending = await verification_pending.find_one({"group_id": gid, "user_id": uid})
+        if not pending:
+            await message.reply_text("❌ No pending verification was found for this group.")
+            return
+        if pending.get("status") in VERIFIED_PENDING_STATUSES:
+            await fully_unmute_member(gid, uid)
+            await message.reply_text("✅ You are already verified for this group.")
+            return
+        name = await get_group_name(gid)
+        await message.reply_text(
+            "🔐 **Verification Required**\n\n"
+            f"**Group:** {name}\n\n"
+            "You joined before completing verification, so messaging is temporarily restricted.\n"
+            "Complete verification below to restore full access.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(f"✅ Verify for {name}"[:64], web_app=WebAppInfo(url=verification_url(gid)))
+            ]]),
+        )
+        return
+    await message.reply_text(help_text(owner_only(uid)))
 
 
 @bot.on_message(filters.command("help"))
@@ -355,6 +538,9 @@ async def on_join_request(_, join_request):
             "user_id": uid,
             "status": "pending",
             "requested_at": datetime.now(),
+            "user_chat_id": int(getattr(join_request, "user_chat_id", 0) or 0) or None,
+            "reminder_attempted": False,
+            "reminder_sent": False,
         }},
         upsert=True,
     )
@@ -368,6 +554,70 @@ async def on_join_request(_, join_request):
     await verification_pending.update_one(
         {"group_id": gid, "user_id": uid},
         {"$set": {"dm_sent": bool(sent), "dm_attempted_at": datetime.now()}},
+    )
+
+
+@bot.on_message(filters.group & ~filters.service & ~filters.me)
+async def guard_unverified_group_member(_, message: Message):
+    """If another admin admits an unverified requester, mute them on first message and send a targeted verify prompt."""
+    if not message.from_user or message.from_user.is_bot:
+        return
+    gid = int(message.chat.id)
+    group = await verification_groups.find_one({"chat_id": gid, "enabled": {"$ne": False}})
+    if not group:
+        return
+
+    uid = int(message.from_user.id)
+    try:
+        member = await bot.get_chat_member(gid, uid)
+        if member.status in (enums.ChatMemberStatus.ADMINISTRATOR, enums.ChatMemberStatus.OWNER):
+            return
+    except Exception:
+        pass
+
+    pending = await verification_pending.find_one({"group_id": gid, "user_id": uid})
+    if not pending:
+        return
+    status = str(pending.get("status") or "pending")
+    if status in VERIFIED_PENDING_STATUSES or status.startswith("banned") or status.startswith("auto_banned"):
+        return
+
+    muted = await mute_unverified_member(gid, uid)
+    if muted:
+        try:
+            await message.delete()
+        except Exception as e:
+            logger.debug("Could not delete pre-verification message from %s in %s: %s", uid, gid, e)
+    now = datetime.now()
+    await verification_pending.update_one(
+        {"_id": pending["_id"]},
+        {"$set": {
+            "muted_unverified": bool(muted),
+            "muted_at": now if muted else pending.get("muted_at"),
+            "admitted_before_verification": True,
+        }},
+    )
+
+    # Avoid spamming the group if the handler sees more than one update before the mute takes effect.
+    claim = await verification_pending.update_one(
+        {"_id": pending["_id"], "group_verify_prompt_sent": {"$ne": True}},
+        {"$set": {"group_verify_prompt_sent": True, "group_verify_prompt_sent_at": now}},
+    )
+    if claim.modified_count == 0:
+        return
+
+    deep_link = bot_deep_link(gid, uid)
+    if not deep_link:
+        logger.warning("BOT_USERNAME unavailable; cannot create private deep-link verification prompt.")
+        return
+    name = message.from_user.first_name or "User"
+    await message.reply_text(
+        f"🔐 **Verification Required for {name}**\n\n"
+        "You must complete verification before you can send messages in this group.\n"
+        "Tap the button below to continue in private chat.",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Verify in Private Chat", url=deep_link)
+        ]]),
     )
 
 
@@ -426,11 +676,12 @@ async def manual_ip_review(_, query: CallbackQuery):
         try:
             await bot.approve_chat_join_request(gid, uid)
         except Exception as e:
-            await query.answer(f"Approval failed: {e}", show_alert=True)
-            return
+            # The user may already have been admitted by another admin.
+            logger.info("Join approval during same-IP review returned %s; attempting unmute in case user is already a member.", e)
+        unmuted = await fully_unmute_member(gid, uid)
         new_status = "approved_manual_ip_review"
         action_name = "manual_approve_same_ip"
-        result_text = "✅ Manually approved after same-IP review."
+        result_text = "✅ Manually approved after same-IP review." + (" User unmuted." if unmuted else "")
     else:
         try:
             try:
@@ -475,11 +726,22 @@ def run_web():
 
 
 async def main():
+    global BOT_USERNAME
     threading.Thread(target=run_web, daemon=True).start()
     await bot.start()
     me = await bot.get_me()
+    if not BOT_USERNAME:
+        BOT_USERNAME = (me.username or "").strip().lstrip("@")
     logger.info("Verification bot started as @%s | web=%s | db=%s", me.username, VERIFY_URL or "auto/missing", MONGO_DB_NAME)
-    await idle()
+    reminder_task = asyncio.create_task(verification_reminder_loop())
+    try:
+        await idle()
+    finally:
+        reminder_task.cancel()
+        try:
+            await reminder_task
+        except asyncio.CancelledError:
+            pass
     await bot.stop()
 
 

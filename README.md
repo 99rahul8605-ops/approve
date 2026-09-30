@@ -45,3 +45,9 @@ Default database name is `afk_db` for backward compatibility with existing verif
 - `/verifyexceptions`
 
 Normal users only see the user-facing verification help and `/verify` flow.
+
+## Admitted-before-verification guard
+
+If another group admin approves a join request before the requester verifies, the bot now catches the member on their first group message, mutes them, and posts a targeted **Verify in Private Chat** button. The deep-link is bound to that Telegram user ID, so another member cannot use it for themselves. After successful verification, the bot restores the group's normal member permissions automatically. The triggering unverified message is also deleted when the bot has permission to delete messages.
+
+For this feature, keep the bot as group admin with **Restrict Members** and **Delete Messages** permissions in addition to join-request approval rights.

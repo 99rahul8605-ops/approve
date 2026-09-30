@@ -223,6 +223,43 @@ def decline_and_ban_user(group_id: int, user_id: int):
     return decline_result, ban_result
 
 
+def unmute_user_in_group(group_id: int, user_id: int):
+    """Restore the protected group's normal permissions after verification.
+
+    This also handles the case where another admin approved the join request
+    before verification and the bot muted the member on their first message.
+    """
+    chat = telegram_api("getChat", {"chat_id": group_id})
+    permissions = {}
+    if chat.get("ok"):
+        permissions = (chat.get("result") or {}).get("permissions") or {}
+
+    # If Telegram does not expose group defaults, grant the normal send rights.
+    if not permissions:
+        permissions = {
+            "can_send_messages": True,
+            "can_send_audios": True,
+            "can_send_documents": True,
+            "can_send_photos": True,
+            "can_send_videos": True,
+            "can_send_video_notes": True,
+            "can_send_voice_notes": True,
+            "can_send_polls": True,
+            "can_send_other_messages": True,
+            "can_add_web_page_previews": True,
+            "can_invite_users": True,
+        }
+
+    return telegram_api(
+        "restrictChatMember",
+        {
+            "chat_id": group_id,
+            "user_id": user_id,
+            "permissions": json.dumps(permissions, separators=(",", ":")),
+        },
+    )
+
+
 def send_owner_message(text: str, reply_markup: Optional[dict] = None):
     if not OWNER_ID:
         return {"ok": False, "description": "OWNER_ID not configured"}
@@ -818,6 +855,9 @@ def verify_api():
             {"chat_id": target_group_id, "user_id": telegram_user_id},
         )
         approved = bool(approve_result.get("ok"))
+        unmute_result = unmute_user_in_group(target_group_id, telegram_user_id)
+        unmuted = bool(unmute_result.get("ok"))
+        access_restored = approved or unmuted
 
         verification_actions.insert_one({
             "event_id": inserted.inserted_id,
@@ -826,25 +866,29 @@ def verify_api():
             "action": "approve_exception",
             "approve_ok": approved,
             "approve_error": approve_result.get("description"),
+            "unmute_ok": unmuted,
+            "unmute_error": unmute_result.get("description"),
             "created_at": datetime.now(timezone.utc),
         })
         verification_pending.update_one(
             {"group_id": target_group_id, "user_id": telegram_user_id},
             {"$set": {
-                "status": "approved_exception" if approved else "verified_waiting_approval",
+                "status": "approved_exception" if access_restored else "verified_waiting_approval",
                 "verified_at": datetime.now(timezone.utc),
                 "verification_event_id": inserted.inserted_id,
                 "exception_bypass": True,
+                "muted_unverified": False if unmuted else None,
+                "unmuted_at": datetime.now(timezone.utc) if unmuted else None,
             }},
             upsert=True,
         )
 
-        if approved:
+        if access_restored:
             return jsonify({
                 "ok": True,
                 "status": "approved",
                 "group_name": get_group_title(target_group_id),
-                "message": "Verification completed successfully. Your join request has been approved.",
+                "message": "Verification completed successfully. Your group access has been restored.",
             }), 200
         return jsonify({
             "ok": True,
@@ -1030,13 +1074,18 @@ def verify_api():
         {"chat_id": target_group_id, "user_id": telegram_user_id},
     )
     approved = bool(approve_result.get("ok"))
+    unmute_result = unmute_user_in_group(target_group_id, telegram_user_id)
+    unmuted = bool(unmute_result.get("ok"))
+    access_restored = approved or unmuted
     verification_pending.update_one(
         {"group_id": target_group_id, "user_id": telegram_user_id},
         {"$set": {
-            "status": "approved" if approved else "verified_waiting_approval",
+            "status": "approved" if access_restored else "verified_waiting_approval",
             "verified_at": datetime.now(timezone.utc),
             "verification_event_id": inserted.inserted_id,
             "approval_error": None if approved else approve_result.get("description"),
+            "muted_unverified": False if unmuted else None,
+            "unmuted_at": datetime.now(timezone.utc) if unmuted else None,
         }},
         upsert=True,
     )
@@ -1045,18 +1094,20 @@ def verify_api():
         "event_id": inserted.inserted_id,
         "telegram_user_id": telegram_user_id,
         "group_id": target_group_id,
-        "action": "approve_join_request" if approved else "join_approval_failed",
-        "error": None if approved else approve_result.get("description"),
+        "action": "approve_join_request" if access_restored else "join_approval_failed",
+        "error": None if access_restored else approve_result.get("description"),
+        "unmute_ok": unmuted,
+        "unmute_error": unmute_result.get("description"),
         "created_at": datetime.now(timezone.utc),
     })
 
     return jsonify({
         "ok": True,
         "status": "verified",
-        "approved": approved,
+        "approved": access_restored,
         "message": (
-            "Verification completed successfully. Your join request has been approved."
-            if approved else
+            "Verification completed successfully. Your group access has been restored."
+            if access_restored else
             "Verification completed successfully. Your join request is waiting for approval."
         ),
     })
