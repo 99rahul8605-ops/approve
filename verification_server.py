@@ -537,34 +537,30 @@ def same_ip_matches_for_current_user(current_user_id: int, ip: str):
 
 
 
-def banned_same_ip_matches_for_current_user(current_user_id: int, ip: str):
-    """Return same-IP historical IDs that are CURRENTLY banned in a protected group.
+def banned_same_ip_matches_for_current_user(current_user_id: int, ip: str, target_group_id: int):
+    """Return same-IP historical IDs that are CURRENTLY banned in THIS target group.
 
-    A same-IP match by itself is never enough for auto-ban. This helper adds the
-    live Telegram ban-list check required by the optional /ipban policy.
+    A ban in some other verification group must never cause an automatic ban
+    in the group the current user is trying to join.
     """
     results = []
     seen = set()
+    target_group_id = int(target_group_id)
 
     for old in same_ip_matches_for_current_user(current_user_id, ip):
         old_user_id = int(old.get("telegram_user_id", 0) or 0)
-        if not old_user_id:
+        if not old_user_id or old_user_id in seen:
+            continue
+        seen.add(old_user_id)
+
+        banned, member = is_banned_in_group(target_group_id, old_user_id)
+        if not banned:
             continue
 
-        for group_id in get_verification_group_ids():
-            key = (old_user_id, int(group_id))
-            if key in seen:
-                continue
-            seen.add(key)
-
-            banned, member = is_banned_in_group(group_id, old_user_id)
-            if not banned:
-                continue
-
-            item = dict(old)
-            item["banned_group_id"] = int(group_id)
-            item["ban_member"] = member
-            results.append(item)
+        item = dict(old)
+        item["banned_group_id"] = target_group_id
+        item["ban_member"] = member
+        results.append(item)
 
     return results
 
@@ -574,10 +570,11 @@ def banned_matches_for_current_user(
     fingerprint: str,
     ip: str,
     device: dict,
+    target_group_id: int,
 ):
     """
     Return prior Telegram IDs that used the exact same device fingerprint and
-    are currently banned in at least one configured verification group.
+    are currently banned in THIS target verification group.
 
     IP and browser fields are retained only for logs/diagnostics. They never
     cause an automatic ban by themselves.
@@ -611,23 +608,23 @@ def banned_matches_for_current_user(
             "language": bool(device.get("language") and old_device.get("language") == device.get("language")),
         }
 
-        for group_id in get_verification_group_ids():
-            banned, member = is_banned_in_group(group_id, old_user_id)
-            if not banned:
-                continue
+        group_id = int(target_group_id)
+        banned, member = is_banned_in_group(group_id, old_user_id)
+        if not banned:
+            continue
 
-            matches.append({
-                "group_id": group_id,
-                "matched_user_id": old_user_id,
-                "score": 100,
-                "level": "high",
-                "reason": "same device fingerprint + matched Telegram ID is banned",
-                "fingerprint_same": True,
-                "ip_same": ip_same,
-                "supporting": supporting,
-                "old_event": old,
-                "member": member,
-            })
+        matches.append({
+            "group_id": group_id,
+            "matched_user_id": old_user_id,
+            "score": 100,
+            "level": "high",
+            "reason": "same device fingerprint + matched Telegram ID is banned in this group",
+            "fingerprint_same": True,
+            "ip_same": ip_same,
+            "supporting": supporting,
+            "old_event": old,
+            "member": member,
+        })
 
     matches.sort(key=lambda x: x["score"], reverse=True)
     return matches
@@ -702,71 +699,103 @@ def notify_high_risk(current_doc: dict, match: dict, ban_results: list):
     send_owner_message(text)
 
 
+
+def format_verification_identity_details(doc: dict, *, include_ban_group: bool = False) -> str:
+    """Full admin-facing verification details for comparison/review."""
+    name = doc.get("name") or "Unknown"
+    username = doc.get("username")
+    label = name + (f" (@{username})" if username else "")
+    device = doc.get("device") or {}
+
+    fingerprint = doc.get("fingerprint") or "N/A"
+    ip = doc.get("ip") or "N/A"
+
+    lines = [
+        f"👤 {h(label)}",
+        f"🆔 <code>{int(doc.get('telegram_user_id', 0) or 0)}</code>",
+        f"🌐 IP: <code>{h(ip)}</code>",
+        f"📍 Approx: {h(location_text(doc))}",
+        f"🧩 Fingerprint: <code>{h(fingerprint)}</code>",
+    ]
+
+    # Device/browser signals help the admin compare two same-IP users.
+    if device.get("platform"):
+        lines.append(f"💻 Platform: <code>{h(device.get('platform'))}</code>")
+    if device.get("screen"):
+        lines.append(f"🖥 Screen: <code>{h(device.get('screen'))}</code>")
+    if device.get("timezone"):
+        lines.append(f"🕒 Timezone: <code>{h(device.get('timezone'))}</code>")
+    if device.get("language"):
+        lines.append(f"🌐 Language: <code>{h(device.get('language'))}</code>")
+    if device.get("hardware_concurrency") not in (None, ""):
+        lines.append(f"⚙️ CPU Threads: <code>{h(device.get('hardware_concurrency'))}</code>")
+    if device.get("max_touch_points") not in (None, ""):
+        lines.append(f"👆 Touch Points: <code>{h(device.get('max_touch_points'))}</code>")
+    if device.get("user_agent"):
+        ua = str(device.get("user_agent"))
+        if len(ua) > 220:
+            ua = ua[:217] + "..."
+        lines.append(f"🧭 User-Agent: <code>{h(ua)}</code>")
+
+    if include_ban_group and doc.get("banned_group_id"):
+        lines.append(f"🚫 Banned in: <code>{int(doc.get('banned_group_id'))}</code>")
+
+    return "\n".join(lines)
+
+
 def notify_same_ip_autoban(current_doc: dict, ip_matches: list, ban_result: dict):
-    """Inform the owner when same IP is linked to an ID that is currently banned."""
-    cur_name = current_doc.get("name") or "Unknown"
-    cur_username = current_doc.get("username")
-    cur_label = cur_name + (f" (@{cur_username})" if cur_username else "")
+    """Inform the owner with full current + matched-user details."""
     group_id = int(current_doc.get("target_group_id") or 0)
     group_name = get_group_title(group_id)
 
-    lines = []
-    for old in ip_matches[:8]:
-        old_name = old.get("name") or "Unknown"
-        old_username = old.get("username")
-        old_label = old_name + (f" (@{old_username})" if old_username else "")
-        banned_gid = old.get("banned_group_id")
-        group_note = f" | banned in <code>{int(banned_gid)}</code>" if banned_gid else ""
-        lines.append(
-            f"• {h(old_label)} — <code>{int(old.get('telegram_user_id', 0) or 0)}</code>"
-            f" | {h(location_text(old))}{group_note}"
+    matched_blocks = []
+    for idx, old in enumerate(ip_matches[:8], start=1):
+        matched_blocks.append(
+            f"<b>Matched banned ID #{idx}</b>\n"
+            + format_verification_identity_details(old, include_ban_group=True)
         )
 
-    action_text = "✅ Ban applied" if ban_result.get("ok") else f"⚠️ Ban failed: {h(ban_result.get('description') or 'Unknown error')}"
+    action_text = (
+        "✅ Ban applied"
+        if ban_result.get("ok")
+        else f"⚠️ Ban failed: {h(ban_result.get('description') or 'Unknown error')}"
+    )
+
     text = (
         "🚫 <b>Same-IP Auto-Ban Alert</b>\n\n"
-        f"<b>Group:</b> {h(group_name)} (<code>{group_id}</code>)\n"
-        f"<b>Current user:</b> {h(cur_label)}\n"
-        f"🆔 <code>{current_doc['telegram_user_id']}</code>\n"
-        f"🌐 IP: <code>{h(current_doc.get('ip') or 'N/A')}</code>\n"
-        f"📍 Approx: {h(location_text(current_doc))}\n"
-        f"🧩 Fingerprint: <code>{h(short_fp(current_doc.get('fingerprint')))}</code>\n\n"
-        f"<b>Banned IDs linked to this IP:</b> {len(ip_matches)}\n"
-        + ("\n".join(lines) if lines else "None")
-        + f"\n\n<b>Same-IP Auto Ban is ON and a linked ID is currently banned.</b>\n{action_text}"
+        f"<b>Group:</b> {h(group_name)} (<code>{group_id}</code>)\n\n"
+        "<b>Current user</b>\n"
+        + format_verification_identity_details(current_doc)
+        + "\n\n"
+        f"<b>Banned IDs linked to this IP:</b> {len(ip_matches)}\n\n"
+        + ("\n\n".join(matched_blocks) if matched_blocks else "None")
+        + "\n\n<b>Decision:</b> Same-IP Auto Ban is ON and at least one linked ID is currently banned in this same group.\n"
+        + action_text
     )
     return send_owner_message(text)
 
 
 def notify_same_ip_review(current_doc: dict, ip_matches: list, event_id):
-    """Alert the owner and leave the join request pending for a manual decision."""
-    cur_name = current_doc.get("name") or "Unknown"
-    cur_username = current_doc.get("username")
-    cur_label = cur_name + (f" (@{cur_username})" if cur_username else "")
+    """Alert the owner with full details and leave the request pending for a manual decision."""
     group_id = int(current_doc.get("target_group_id") or 0)
     group_name = get_group_title(group_id)
 
-    lines = []
-    for old in ip_matches[:8]:
-        old_name = old.get("name") or "Unknown"
-        old_username = old.get("username")
-        old_label = old_name + (f" (@{old_username})" if old_username else "")
-        lines.append(
-            f"• {h(old_label)} — <code>{int(old.get('telegram_user_id', 0) or 0)}</code>"
-            f" | {h(location_text(old))}"
+    matched_blocks = []
+    for idx, old in enumerate(ip_matches[:8], start=1):
+        matched_blocks.append(
+            f"<b>Other ID on same IP #{idx}</b>\n"
+            + format_verification_identity_details(old)
         )
 
     text = (
         "⚠️ <b>Same-IP Verification Alert</b>\n\n"
-        f"<b>Group:</b> {h(group_name)} (<code>{group_id}</code>)\n"
-        f"<b>Current user:</b> {h(cur_label)}\n"
-        f"🆔 <code>{current_doc['telegram_user_id']}</code>\n"
-        f"🌐 IP: <code>{h(current_doc.get('ip') or 'N/A')}</code>\n"
-        f"📍 Approx: {h(location_text(current_doc))}\n"
-        f"🧩 Fingerprint: <code>{h(short_fp(current_doc.get('fingerprint')))}</code>\n\n"
-        f"<b>Other IDs previously seen on this IP:</b> {len(ip_matches)}\n"
-        + ("\n".join(lines) if lines else "None")
-        + "\n\nSame IP alone does <b>not</b> auto-ban this user. Review and choose an action below."
+        f"<b>Group:</b> {h(group_name)} (<code>{group_id}</code>)\n\n"
+        "<b>Current user</b>\n"
+        + format_verification_identity_details(current_doc)
+        + "\n\n"
+        f"<b>Other IDs previously seen on this IP:</b> {len(ip_matches)}\n\n"
+        + ("\n\n".join(matched_blocks) if matched_blocks else "None")
+        + "\n\n<b>Decision required:</b> Same IP alone does not auto-ban this user. Compare the details above and choose an action."
     )
 
     keyboard = {
@@ -1009,6 +1038,7 @@ def verify_api():
         fingerprint=fingerprint,
         ip=ip,
         device=device,
+        target_group_id=target_group_id,
     )
 
     best = matches[0] if matches else None
@@ -1016,15 +1046,14 @@ def verify_api():
 
     if banned_device_match and AUTO_BAN_HIGH_RISK:
         ban_results = []
-        for group_id in get_verification_group_ids():
-            decline_result, result = decline_and_ban_user(group_id, telegram_user_id)
-            ban_results.append({
-                "group_id": group_id,
-                "ok": bool(result.get("ok")),
-                "error": result.get("description"),
-                "join_request_declined": bool(decline_result.get("ok")),
-                "decline_error": decline_result.get("description"),
-            })
+        decline_result, result = decline_and_ban_user(target_group_id, telegram_user_id)
+        ban_results.append({
+            "group_id": target_group_id,
+            "ok": bool(result.get("ok")),
+            "error": result.get("description"),
+            "join_request_declined": bool(decline_result.get("ok")),
+            "decline_error": decline_result.get("description"),
+        })
 
         current_doc["decision"] = "auto_banned"
         current_doc["risk_level"] = "high"
@@ -1069,16 +1098,16 @@ def verify_api():
     # Same-IP behavior is controlled live by the bot owner via /ipban.
     # IMPORTANT: same IP alone NEVER auto-bans.
     # ON  -> auto-ban only when at least one historical ID on this exact IP is
-    #        currently banned in a configured verification group.
+    #        currently banned in THIS SAME target group.
     # OFF -> every same-IP match stays pending for manual owner review.
     ip_matches = same_ip_matches_for_current_user(telegram_user_id, ip)
-    banned_ip_matches = banned_same_ip_matches_for_current_user(telegram_user_id, ip)
+    banned_ip_matches = banned_same_ip_matches_for_current_user(telegram_user_id, ip, target_group_id)
     if banned_ip_matches and same_ip_autoban_enabled():
         decline_result, ban_result = decline_and_ban_user(target_group_id, telegram_user_id)
         current_doc["decision"] = "auto_banned_same_ip_banned_link"
         current_doc["risk_level"] = "ip_banned_link"
         current_doc["risk_score"] = 100
-        current_doc["match_reason"] = "same IP is linked to a Telegram ID that is currently banned"
+        current_doc["match_reason"] = "same IP is linked to a Telegram ID that is currently banned in this group"
         current_doc["same_ip_user_ids"] = [
             int(x.get("telegram_user_id", 0) or 0) for x in ip_matches
             if x.get("telegram_user_id")

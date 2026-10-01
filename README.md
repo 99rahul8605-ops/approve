@@ -10,7 +10,7 @@ This package contains only the verification system. It does not contain AFK, for
 - Target group's Telegram profile photo displayed on the verification page
 - Exact-device + currently banned linked account => decline pending request, then auto-ban
 - Same-IP match => owner manual review by default
-- Optional `/ipban` policy: auto-ban only when the same IP is linked to a currently banned ID
+- Optional `/ipban` policy: auto-ban only when the same IP is linked to an ID currently banned in the same target group
 - Verification exceptions via `/addexception`, `/removeexception`, `/verifyexceptions`
 - Suspicious user-facing block screen does not disclose linked-account details
 - Manual review Approve/Ban buttons for the owner

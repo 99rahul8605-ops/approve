@@ -359,7 +359,7 @@ def help_text(is_owner: bool) -> str:
             "• `/removeverifygroup` — Remove current group from verification\n"
             "• `/removeverifygroup <group_id>` — Remove by ID\n"
             "• `/verifygroups` — List protected groups\n"
-            "• `/ipban` — Auto-ban only when same IP has a currently banned linked ID\n"
+            "• `/ipban` — Auto-ban only when same IP has a linked ID banned in the same group\n"
             "• `/addexception <user_id>` — Add anti-fraud exception\n"
             "• `/removeexception <user_id>` — Remove exception\n"
             "• `/verifyexceptions` — List exceptions\n\n"
@@ -465,8 +465,8 @@ async def ipban_cmd(_, message: Message):
     await message.reply_text(
         "🌐 **Same-IP Auto Ban**\n\n"
         f"Status: **{'🟢 ON' if enabled else '🔴 OFF'}**\n\n"
-        "ON → auto-ban only if the same IP is linked to an ID that is currently banned.\n"
-        "Same IP with no banned linked ID → manual Approve / Ban review.\n"
+        "ON → auto-ban only if the same IP is linked to an ID that is currently banned in this same group.\n"
+        "Same IP with no ID banned in this group → manual Approve / Ban review.\n"
         "OFF → all same-IP matches go to manual review.\n\n"
         "Exact-device + banned-ID protection remains active separately.",
         reply_markup=InlineKeyboardMarkup([[
@@ -486,8 +486,8 @@ async def ipban_toggle(_, query: CallbackQuery):
     await query.message.edit_text(
         "🌐 **Same-IP Auto Ban**\n\n"
         f"Status: **{'🟢 ON' if enabled else '🔴 OFF'}**\n\n"
-        "ON → auto-ban only if the same IP is linked to an ID that is currently banned.\n"
-        "Same IP with no banned linked ID → manual Approve / Ban review.\n"
+        "ON → auto-ban only if the same IP is linked to an ID that is currently banned in this same group.\n"
+        "Same IP with no ID banned in this group → manual Approve / Ban review.\n"
         "OFF → all same-IP matches wait for manual review.\n\n"
         "Exact-device + banned-ID protection remains active separately.",
         reply_markup=InlineKeyboardMarkup([[
