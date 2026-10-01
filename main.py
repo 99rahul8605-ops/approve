@@ -359,7 +359,7 @@ def help_text(is_owner: bool) -> str:
             "• `/removeverifygroup` — Remove current group from verification\n"
             "• `/removeverifygroup <group_id>` — Remove by ID\n"
             "• `/verifygroups` — List protected groups\n"
-            "• `/ipban` — Same-IP auto-ban ON/OFF\n"
+            "• `/ipban` — Auto-ban only when same IP has a currently banned linked ID\n"
             "• `/addexception <user_id>` — Add anti-fraud exception\n"
             "• `/removeexception <user_id>` — Remove exception\n"
             "• `/verifyexceptions` — List exceptions\n\n"
@@ -465,8 +465,9 @@ async def ipban_cmd(_, message: Message):
     await message.reply_text(
         "🌐 **Same-IP Auto Ban**\n\n"
         f"Status: **{'🟢 ON' if enabled else '🔴 OFF'}**\n\n"
-        "ON → same-IP match automatically bans the new requester.\n"
-        "OFF → same-IP match is sent to you for manual Approve / Ban review.\n\n"
+        "ON → auto-ban only if the same IP is linked to an ID that is currently banned.\n"
+        "Same IP with no banned linked ID → manual Approve / Ban review.\n"
+        "OFF → all same-IP matches go to manual review.\n\n"
         "Exact-device + banned-ID protection remains active separately.",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ Turn ON", callback_data="vipsetting:ipban:on"),
@@ -485,8 +486,9 @@ async def ipban_toggle(_, query: CallbackQuery):
     await query.message.edit_text(
         "🌐 **Same-IP Auto Ban**\n\n"
         f"Status: **{'🟢 ON' if enabled else '🔴 OFF'}**\n\n"
-        "ON → same-IP match automatically bans the new requester.\n"
-        "OFF → same-IP match waits for manual Approve / Ban review.\n\n"
+        "ON → auto-ban only if the same IP is linked to an ID that is currently banned.\n"
+        "Same IP with no banned linked ID → manual Approve / Ban review.\n"
+        "OFF → all same-IP matches wait for manual review.\n\n"
         "Exact-device + banned-ID protection remains active separately.",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ Turn ON", callback_data="vipsetting:ipban:on"),

@@ -536,6 +536,39 @@ def same_ip_matches_for_current_user(current_user_id: int, ip: str):
     return result
 
 
+
+def banned_same_ip_matches_for_current_user(current_user_id: int, ip: str):
+    """Return same-IP historical IDs that are CURRENTLY banned in a protected group.
+
+    A same-IP match by itself is never enough for auto-ban. This helper adds the
+    live Telegram ban-list check required by the optional /ipban policy.
+    """
+    results = []
+    seen = set()
+
+    for old in same_ip_matches_for_current_user(current_user_id, ip):
+        old_user_id = int(old.get("telegram_user_id", 0) or 0)
+        if not old_user_id:
+            continue
+
+        for group_id in get_verification_group_ids():
+            key = (old_user_id, int(group_id))
+            if key in seen:
+                continue
+            seen.add(key)
+
+            banned, member = is_banned_in_group(group_id, old_user_id)
+            if not banned:
+                continue
+
+            item = dict(old)
+            item["banned_group_id"] = int(group_id)
+            item["ban_member"] = member
+            results.append(item)
+
+    return results
+
+
 def banned_matches_for_current_user(
     current_user_id: int,
     fingerprint: str,
@@ -670,7 +703,7 @@ def notify_high_risk(current_doc: dict, match: dict, ban_results: list):
 
 
 def notify_same_ip_autoban(current_doc: dict, ip_matches: list, ban_result: dict):
-    """Inform the owner after the optional same-IP auto-ban policy fires."""
+    """Inform the owner when same IP is linked to an ID that is currently banned."""
     cur_name = current_doc.get("name") or "Unknown"
     cur_username = current_doc.get("username")
     cur_label = cur_name + (f" (@{cur_username})" if cur_username else "")
@@ -682,9 +715,11 @@ def notify_same_ip_autoban(current_doc: dict, ip_matches: list, ban_result: dict
         old_name = old.get("name") or "Unknown"
         old_username = old.get("username")
         old_label = old_name + (f" (@{old_username})" if old_username else "")
+        banned_gid = old.get("banned_group_id")
+        group_note = f" | banned in <code>{int(banned_gid)}</code>" if banned_gid else ""
         lines.append(
             f"• {h(old_label)} — <code>{int(old.get('telegram_user_id', 0) or 0)}</code>"
-            f" | {h(location_text(old))}"
+            f" | {h(location_text(old))}{group_note}"
         )
 
     action_text = "✅ Ban applied" if ban_result.get("ok") else f"⚠️ Ban failed: {h(ban_result.get('description') or 'Unknown error')}"
@@ -696,9 +731,9 @@ def notify_same_ip_autoban(current_doc: dict, ip_matches: list, ban_result: dict
         f"🌐 IP: <code>{h(current_doc.get('ip') or 'N/A')}</code>\n"
         f"📍 Approx: {h(location_text(current_doc))}\n"
         f"🧩 Fingerprint: <code>{h(short_fp(current_doc.get('fingerprint')))}</code>\n\n"
-        f"<b>Other IDs previously seen on this IP:</b> {len(ip_matches)}\n"
+        f"<b>Banned IDs linked to this IP:</b> {len(ip_matches)}\n"
         + ("\n".join(lines) if lines else "None")
-        + f"\n\n<b>Same-IP Auto Ban is ON.</b>\n{action_text}"
+        + f"\n\n<b>Same-IP Auto Ban is ON and a linked ID is currently banned.</b>\n{action_text}"
     )
     return send_owner_message(text)
 
@@ -1032,19 +1067,30 @@ def verify_api():
         }), 403
 
     # Same-IP behavior is controlled live by the bot owner via /ipban.
-    # ON  -> exact same IP used by another verified Telegram ID auto-bans this requester.
-    # OFF -> keep the join request pending for manual owner review.
+    # IMPORTANT: same IP alone NEVER auto-bans.
+    # ON  -> auto-ban only when at least one historical ID on this exact IP is
+    #        currently banned in a configured verification group.
+    # OFF -> every same-IP match stays pending for manual owner review.
     ip_matches = same_ip_matches_for_current_user(telegram_user_id, ip)
-    if ip_matches and same_ip_autoban_enabled():
+    banned_ip_matches = banned_same_ip_matches_for_current_user(telegram_user_id, ip)
+    if banned_ip_matches and same_ip_autoban_enabled():
         decline_result, ban_result = decline_and_ban_user(target_group_id, telegram_user_id)
-        current_doc["decision"] = "auto_banned_same_ip"
-        current_doc["risk_level"] = "ip_match"
-        current_doc["risk_score"] = 0
-        current_doc["match_reason"] = "same IP used by another verified Telegram ID"
+        current_doc["decision"] = "auto_banned_same_ip_banned_link"
+        current_doc["risk_level"] = "ip_banned_link"
+        current_doc["risk_score"] = 100
+        current_doc["match_reason"] = "same IP is linked to a Telegram ID that is currently banned"
         current_doc["same_ip_user_ids"] = [
             int(x.get("telegram_user_id", 0) or 0) for x in ip_matches
             if x.get("telegram_user_id")
         ]
+        current_doc["same_ip_banned_user_ids"] = sorted({
+            int(x.get("telegram_user_id", 0) or 0) for x in banned_ip_matches
+            if x.get("telegram_user_id")
+        })
+        current_doc["same_ip_banned_groups"] = sorted({
+            int(x.get("banned_group_id", 0) or 0) for x in banned_ip_matches
+            if x.get("banned_group_id")
+        })
         current_doc["ban_results"] = [{
             "group_id": target_group_id,
             "ok": bool(ban_result.get("ok")),
@@ -1058,7 +1104,7 @@ def verify_api():
             "event_id": inserted.inserted_id,
             "telegram_user_id": telegram_user_id,
             "group_id": target_group_id,
-            "action": "auto_ban_same_ip",
+            "action": "auto_ban_same_ip_banned_link",
             "same_ip_user_ids": current_doc["same_ip_user_ids"],
             "ban_result": current_doc["ban_results"][0],
             "created_at": datetime.now(timezone.utc),
@@ -1066,7 +1112,7 @@ def verify_api():
         verification_pending.update_one(
             {"group_id": target_group_id, "user_id": telegram_user_id},
             {"$set": {
-                "status": "auto_banned_same_ip",
+                "status": "auto_banned_same_ip_banned_link",
                 "verified_at": datetime.now(timezone.utc),
                 "verification_event_id": inserted.inserted_id,
                 "same_ip_user_ids": current_doc["same_ip_user_ids"],
@@ -1075,7 +1121,7 @@ def verify_api():
         )
 
         try:
-            notify_same_ip_autoban(current_doc, ip_matches, current_doc["ban_results"][0])
+            notify_same_ip_autoban(current_doc, banned_ip_matches, current_doc["ban_results"][0])
         except Exception as e:
             logger.exception("Same-IP auto-ban owner notification failed: %s", e)
 
