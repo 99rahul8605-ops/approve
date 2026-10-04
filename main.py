@@ -466,8 +466,8 @@ async def ipban_cmd(_, message: Message):
         "🌐 **Same-IP Auto Ban**\n\n"
         f"Status: **{'🟢 ON' if enabled else '🔴 OFF'}**\n\n"
         "ON → auto-ban only if the same IP is linked to an ID that is currently banned in this same group.\n"
-        "Same IP with no ID banned in this group → manual Approve / Ban review.\n"
-        "OFF → all same-IP matches go to manual review.\n\n"
+        "Same IP with no ID banned in this group → auto-approve after verification.\n"
+        "OFF → only same-IP matches linked to an ID banned in this group go to manual review.\n\n"
         "Exact-device + banned-ID protection remains active separately.",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ Turn ON", callback_data="vipsetting:ipban:on"),
@@ -487,8 +487,8 @@ async def ipban_toggle(_, query: CallbackQuery):
         "🌐 **Same-IP Auto Ban**\n\n"
         f"Status: **{'🟢 ON' if enabled else '🔴 OFF'}**\n\n"
         "ON → auto-ban only if the same IP is linked to an ID that is currently banned in this same group.\n"
-        "Same IP with no ID banned in this group → manual Approve / Ban review.\n"
-        "OFF → all same-IP matches wait for manual review.\n\n"
+        "Same IP with no ID banned in this group → auto-approve after verification.\n"
+        "OFF → only same-IP matches linked to an ID banned in this group wait for manual review.\n\n"
         "Exact-device + banned-ID protection remains active separately.",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ Turn ON", callback_data="vipsetting:ipban:on"),

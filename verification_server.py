@@ -1161,23 +1161,30 @@ def verify_api():
             "message": "We found suspicious activity during verification. Please contact the group administrator.",
         }), 403
 
-    if ip_matches:
-        current_doc["decision"] = "manual_review_ip"
+    # If the same IP is linked to an ID banned in THIS group but /ipban is OFF,
+    # keep it for manual review. Same IP alone is harmless and must auto-approve.
+    if banned_ip_matches:
+        current_doc["decision"] = "manual_review_ip_banned_link"
         current_doc["risk_level"] = "review"
         current_doc["risk_score"] = 0
-        current_doc["match_reason"] = "same IP used by another verified Telegram ID"
+        current_doc["match_reason"] = "same IP is linked to an ID banned in this group; auto-ban is OFF"
         current_doc["same_ip_user_ids"] = [
             int(x.get("telegram_user_id", 0) or 0) for x in ip_matches
             if x.get("telegram_user_id")
         ]
+        current_doc["same_ip_banned_user_ids"] = sorted({
+            int(x.get("telegram_user_id", 0) or 0) for x in banned_ip_matches
+            if x.get("telegram_user_id")
+        })
 
         inserted = verification_events.insert_one(current_doc)
         verification_actions.insert_one({
             "event_id": inserted.inserted_id,
             "telegram_user_id": telegram_user_id,
             "group_id": target_group_id,
-            "action": "manual_review_same_ip",
+            "action": "manual_review_same_ip_banned_link",
             "same_ip_user_ids": current_doc["same_ip_user_ids"],
+            "same_ip_banned_user_ids": current_doc["same_ip_banned_user_ids"],
             "created_at": datetime.now(timezone.utc),
         })
 
@@ -1188,14 +1195,15 @@ def verify_api():
                 "verified_at": datetime.now(timezone.utc),
                 "verification_event_id": inserted.inserted_id,
                 "same_ip_user_ids": current_doc["same_ip_user_ids"],
+                "same_ip_banned_user_ids": current_doc["same_ip_banned_user_ids"],
             }},
             upsert=True,
         )
 
         try:
-            notify_same_ip_review(current_doc, ip_matches, inserted.inserted_id)
+            notify_same_ip_review(current_doc, banned_ip_matches, inserted.inserted_id)
         except Exception as e:
-            logger.exception("Same-IP owner notification failed: %s", e)
+            logger.exception("Same-IP banned-link owner notification failed: %s", e)
 
         return jsonify({
             "ok": True,
@@ -1204,7 +1212,16 @@ def verify_api():
             "message": "Verification submitted for administrator review. Please wait for approval.",
         }), 200
 
-    # No banned device match and no same-IP review signal: approve.
+    # Same IP with no banned linked ID in this group is only informational.
+    # Record it for audit, but do NOT alert the owner and do NOT block approval.
+    if ip_matches:
+        current_doc["same_ip_user_ids"] = [
+            int(x.get("telegram_user_id", 0) or 0) for x in ip_matches
+            if x.get("telegram_user_id")
+        ]
+        current_doc["same_ip_note"] = "same IP seen, but no linked ID is banned in this group"
+
+    # No banned device match and no banned same-IP link: approve.
     current_doc["decision"] = "verified"
     current_doc["risk_level"] = best["level"] if best else "none"
     current_doc["risk_score"] = best["score"] if best else 0
