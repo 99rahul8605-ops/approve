@@ -40,8 +40,8 @@ Default database name is `afk_db` for backward compatibility with existing verif
 - `/removeverifygroup <group_id>`
 - `/verifygroups`
 - `/ipban`
-- `/addexception <user_id>` or reply with `/addexception`
-- `/removeexception <user_id>` or reply with `/removeexception`
+- `/addexception <user_id/@username>` or reply with `/addexception`
+- `/removeexception <user_id/@username>` or reply with `/removeexception`
 - `/verifyexceptions`
 
 Normal users only see the user-facing verification help and `/verify` flow.

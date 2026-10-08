@@ -171,15 +171,34 @@ def bot_deep_link(group_id: int, user_id: int) -> str:
     return f"https://t.me/{username}?start=verify_{int(group_id)}_{int(user_id)}"
 
 
-def target_user_id(message: Message) -> Optional[int]:
+async def resolve_target_user(message: Message):
+    """Resolve reply, numeric Telegram ID, or @username/username for owner commands."""
     if message.reply_to_message and message.reply_to_message.from_user:
-        return int(message.reply_to_message.from_user.id)
-    if len(message.command) > 1:
-        try:
-            return int(message.command[1])
-        except Exception:
-            return None
-    return None
+        return message.reply_to_message.from_user
+
+    if len(message.command) <= 1:
+        return None
+
+    raw = str(message.command[1] or "").strip()
+    if not raw:
+        return None
+
+    try:
+        if raw.lstrip("-").isdigit():
+            return await bot.get_users(int(raw))
+
+        username = raw if raw.startswith("@") else f"@{raw}"
+        return await bot.get_users(username)
+    except Exception:
+        return None
+
+
+def user_display(user) -> str:
+    if not user:
+        return "Unknown"
+    name = (getattr(user, "first_name", None) or "User").strip()
+    username = getattr(user, "username", None)
+    return name + (f" (@{username})" if username else "")
 
 
 async def send_join_verification_dm(join_request, group_name: str, group_id: int) -> bool:
@@ -500,26 +519,55 @@ async def ipban_toggle(_, query: CallbackQuery):
 
 @bot.on_message(filters.command("addexception") & filters.user(OWNER_ID))
 async def add_exception_cmd(_, message: Message):
-    uid = target_user_id(message)
-    if not uid:
-        await message.reply_text("Usage: `/addexception <user_id>` or reply to a user's message with `/addexception`.")
+    user = await resolve_target_user(message)
+    if not user:
+        await message.reply_text(
+            "Usage:\n"
+            "`/addexception 123456789`\n"
+            "`/addexception @username`\n"
+            "`/addexception username`\n"
+            "or reply to a user's message with `/addexception`."
+        )
         return
+
+    uid = int(user.id)
     await verification_exceptions.update_one(
         {"user_id": uid},
-        {"$set": {"user_id": uid, "enabled": True, "added_at": datetime.now(), "added_by": OWNER_ID}},
+        {"$set": {
+            "user_id": uid,
+            "username": getattr(user, "username", None),
+            "name": user_display(user),
+            "enabled": True,
+            "added_at": datetime.now(),
+            "added_by": OWNER_ID,
+        }},
         upsert=True,
     )
-    await message.reply_text(f"✅ Exception added for `{uid}`. Verification remains compulsory; anti-fraud device/IP checks are skipped.")
+    await message.reply_text(
+        f"✅ Exception added for **{user_display(user)}** — `{uid}`.\n"
+        "Verification remains compulsory; anti-fraud device/IP checks are skipped."
+    )
 
 
 @bot.on_message(filters.command("removeexception") & filters.user(OWNER_ID))
 async def remove_exception_cmd(_, message: Message):
-    uid = target_user_id(message)
-    if not uid:
-        await message.reply_text("Usage: `/removeexception <user_id>` or reply to a user's message with `/removeexception`.")
+    user = await resolve_target_user(message)
+    if not user:
+        await message.reply_text(
+            "Usage:\n"
+            "`/removeexception 123456789`\n"
+            "`/removeexception @username`\n"
+            "`/removeexception username`\n"
+            "or reply to a user's message with `/removeexception`."
+        )
         return
+
+    uid = int(user.id)
     result = await verification_exceptions.delete_one({"user_id": uid})
-    await message.reply_text(("✅ Removed" if result.deleted_count else "ℹ️ Not found") + f" exception for `{uid}`.")
+    await message.reply_text(
+        ("✅ Removed" if result.deleted_count else "ℹ️ Not found")
+        + f" exception for **{user_display(user)}** — `{uid}`."
+    )
 
 
 @bot.on_message(filters.command("verifyexceptions") & filters.user(OWNER_ID))
