@@ -378,11 +378,12 @@ def help_text(is_owner: bool) -> str:
             "• `/removeverifygroup` — Remove current group from verification\n"
             "• `/removeverifygroup <group_id>` — Remove by ID\n"
             "• `/verifygroups` — List protected groups\n"
-            "• `/ipban` — Auto-ban only when same IP has a linked ID banned in the same group\n"
+            "• `/ipban` — Manage linked-account auto-ban policy for the same group\n"
             "• `/addexception <user_id>` — Add anti-fraud exception\n"
             "• `/removeexception <user_id>` — Remove exception\n"
-            "• `/verifyexceptions` — List exceptions\n\n"
-            "Exceptions still complete verification; only device/IP anti-fraud checks are skipped."
+            "• `/verifyexceptions` — List exceptions\n"
+            "• `/info <user_id>` — View Telegram + verification/device details\n\n"
+            "Exception users are not restricted by the group message guard; verification can still be completed normally."
         )
     return text
 
@@ -482,11 +483,11 @@ async def list_groups_cmd(_, message: Message):
 async def ipban_cmd(_, message: Message):
     enabled = await get_same_ip_autoban_enabled()
     await message.reply_text(
-        "🌐 **Same-IP Auto Ban**\n\n"
+        "🌐 **Network Match Auto Ban**\n\n"
         f"Status: **{'🟢 ON' if enabled else '🔴 OFF'}**\n\n"
-        "ON → auto-ban only if the same IP is linked to an ID that is currently banned in this same group.\n"
+        "ON → auto-ban only if a linked account is currently banned in this same group.\n"
         "Same IP with no ID banned in this group → auto-approve after verification.\n"
-        "OFF → only same-IP matches linked to an ID banned in this group go to manual review.\n\n"
+        "OFF → linked-account matches tied to a banned ID in this group go to manual review.\n\n"
         "Exact-device + banned-ID protection remains active separately.",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ Turn ON", callback_data="vipsetting:ipban:on"),
@@ -503,11 +504,11 @@ async def ipban_toggle(_, query: CallbackQuery):
     enabled = (query.data or "").endswith(":on")
     await set_same_ip_autoban_enabled(enabled)
     await query.message.edit_text(
-        "🌐 **Same-IP Auto Ban**\n\n"
+        "🌐 **Network Match Auto Ban**\n\n"
         f"Status: **{'🟢 ON' if enabled else '🔴 OFF'}**\n\n"
-        "ON → auto-ban only if the same IP is linked to an ID that is currently banned in this same group.\n"
+        "ON → auto-ban only if a linked account is currently banned in this same group.\n"
         "Same IP with no ID banned in this group → auto-approve after verification.\n"
-        "OFF → only same-IP matches linked to an ID banned in this group wait for manual review.\n\n"
+        "OFF → linked-account matches tied to a banned ID in this group wait for manual review.\n\n"
         "Exact-device + banned-ID protection remains active separately.",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ Turn ON", callback_data="vipsetting:ipban:on"),
@@ -515,6 +516,265 @@ async def ipban_toggle(_, query: CallbackQuery):
         ]]),
     )
     await query.answer("Setting updated.")
+
+
+
+def _info_dt(value) -> str:
+    if not value:
+        return "N/A"
+    try:
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return str(value)
+
+
+def _info_location(doc: dict) -> str:
+    geo = (doc or {}).get("geo") or {}
+    parts = [
+        geo.get("city"),
+        geo.get("region"),
+        geo.get("country"),
+    ]
+    return ", ".join(str(x) for x in parts if x) or "Unknown"
+
+
+def _info_user_label_from_event(doc: dict) -> str:
+    name = str((doc or {}).get("name") or "Unknown")
+    username = (doc or {}).get("username")
+    return name + (f" (@{username})" if username else "")
+
+
+async def _linked_verification_ids(user_id: int, field: str, value, limit: int = 10):
+    if not value:
+        return []
+
+    cursor = verification_events.find(
+        {
+            "telegram_user_id": {"$ne": int(user_id)},
+            field: value,
+        }
+    ).sort("created_at", -1)
+
+    rows = await cursor.to_list(length=100)
+    result = []
+    seen = set()
+    for row in rows:
+        uid = int(row.get("telegram_user_id", 0) or 0)
+        if not uid or uid in seen:
+            continue
+        seen.add(uid)
+        result.append(row)
+        if len(result) >= limit:
+            break
+    return result
+
+
+async def _send_html_chunks(message: Message, text_value: str):
+    """Telegram messages are capped; split long /info output on line boundaries."""
+    max_len = 3900
+    if len(text_value) <= max_len:
+        await message.reply_text(
+            text_value,
+            parse_mode=enums.ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        return
+
+    lines = text_value.splitlines()
+    chunks = []
+    current = ""
+    for line in lines:
+        candidate = current + ("\n" if current else "") + line
+        if len(candidate) > max_len and current:
+            chunks.append(current)
+            current = line
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+
+    for chunk in chunks:
+        await message.reply_text(
+            chunk,
+            parse_mode=enums.ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+
+
+@bot.on_message(filters.command("info") & filters.user(OWNER_ID))
+async def user_info_cmd(_, message: Message):
+    """Owner-only Telegram + verification audit lookup.
+
+    Supports numeric Telegram UID as requested, and also reply / @username for convenience.
+    """
+    user = await resolve_target_user(message)
+    if not user:
+        await message.reply_text(
+            "Usage:\n"
+            "<code>/info 123456789</code>\n"
+            "<code>/info @username</code>\n"
+            "or reply to a user's message with <code>/info</code>.",
+            parse_mode=enums.ParseMode.HTML,
+        )
+        return
+
+    uid = int(user.id)
+
+    latest_event = await verification_events.find_one(
+        {"telegram_user_id": uid},
+        sort=[("created_at", -1)],
+    )
+    events = await verification_events.find(
+        {"telegram_user_id": uid}
+    ).sort("created_at", -1).to_list(length=10)
+
+    pending_rows = await verification_pending.find(
+        {"user_id": uid}
+    ).sort("requested_at", -1).to_list(length=100)
+
+    exception = await verification_exceptions.find_one(
+        {"user_id": uid, "enabled": {"$ne": False}}
+    )
+
+    total_events = await verification_events.count_documents({"telegram_user_id": uid})
+    total_actions = await verification_actions.count_documents({"telegram_user_id": uid})
+
+    full_name = " ".join(
+        x for x in [
+            getattr(user, "first_name", None),
+            getattr(user, "last_name", None),
+        ] if x
+    ).strip() or "Unknown"
+    username = getattr(user, "username", None)
+
+    lines = [
+        "👤 <b>User Info</b>",
+        "",
+        f"<b>Name:</b> {html.escape(full_name)}",
+        f"<b>Username:</b> @{html.escape(username)}" if username else "<b>Username:</b> —",
+        f"<b>UID:</b> <code>{uid}</code>",
+        f"<b>Bot:</b> {'Yes' if getattr(user, 'is_bot', False) else 'No'}",
+        f"<b>Premium:</b> {'Yes' if getattr(user, 'is_premium', False) else 'No'}",
+        f"<b>Verified account:</b> {'Yes' if getattr(user, 'is_verified', False) else 'No'}",
+        f"<b>Scam flag:</b> {'Yes' if getattr(user, 'is_scam', False) else 'No'}",
+        f"<b>Fake flag:</b> {'Yes' if getattr(user, 'is_fake', False) else 'No'}",
+        f"<b>Exception:</b> {'✅ Yes' if exception else '❌ No'}",
+        "",
+        "📊 <b>Verification Summary</b>",
+        f"<b>Total verification events:</b> {total_events}",
+        f"<b>Total recorded actions:</b> {total_actions}",
+    ]
+
+    if latest_event:
+        device = latest_event.get("device") or {}
+        fingerprint = latest_event.get("fingerprint") or "N/A"
+        ip = latest_event.get("ip") or "N/A"
+        lines += [
+            "",
+            "🧾 <b>Latest Verification</b>",
+            f"<b>Decision:</b> {html.escape(str(latest_event.get('decision') or 'N/A'))}",
+            f"<b>Risk:</b> {html.escape(str(latest_event.get('risk_level') or 'none'))}"
+            f" ({html.escape(str(latest_event.get('risk_score', 0)))})",
+            f"<b>Group:</b> <code>{int(latest_event.get('target_group_id', 0) or 0)}</code>",
+            f"<b>Network ID:</b> <code>{html.escape(str(ip))}</code>",
+            f"<b>Approx:</b> {html.escape(_info_location(latest_event))}",
+            f"<b>Device ID:</b> <code>{html.escape(str(fingerprint))}</code>",
+            f"<b>Platform:</b> <code>{html.escape(str(device.get('platform') or 'N/A'))}</code>",
+            f"<b>Screen:</b> <code>{html.escape(str(device.get('screen') or 'N/A'))}</code>",
+            f"<b>Timezone:</b> <code>{html.escape(str(device.get('timezone') or 'N/A'))}</code>",
+            f"<b>Language:</b> <code>{html.escape(str(device.get('language') or 'N/A'))}</code>",
+            f"<b>CPU Threads:</b> <code>{html.escape(str(device.get('hardware_concurrency') if device.get('hardware_concurrency') is not None else 'N/A'))}</code>",
+            f"<b>Touch Points:</b> <code>{html.escape(str(device.get('max_touch_points') if device.get('max_touch_points') is not None else 'N/A'))}</code>",
+            f"<b>Verified at:</b> {_info_dt(latest_event.get('created_at'))}",
+        ]
+        ua = str(device.get("user_agent") or "N/A")
+        if len(ua) > 450:
+            ua = ua[:447] + "..."
+        lines.append(f"<b>User-Agent:</b> <code>{html.escape(ua)}</code>")
+
+        same_device = await _linked_verification_ids(uid, "fingerprint", fingerprint, limit=10)
+        same_ip = await _linked_verification_ids(uid, "ip", ip, limit=10)
+
+        lines += ["", f"🧩 <b>Related device IDs ({len(same_device)}):</b>"]
+        if same_device:
+            for row in same_device:
+                other_uid = int(row.get("telegram_user_id", 0) or 0)
+                label = _info_user_label_from_event(row)
+                lines.append(
+                    f"• {html.escape(label)} — <code>{other_uid}</code>"
+                    f" | {html.escape(str(row.get('decision') or 'N/A'))}"
+                )
+        else:
+            lines.append("• None detected")
+
+        lines += ["", f"🌐 <b>Related network IDs ({len(same_ip)}):</b>"]
+        if same_ip:
+            for row in same_ip:
+                other_uid = int(row.get("telegram_user_id", 0) or 0)
+                label = _info_user_label_from_event(row)
+                fp = str(row.get("fingerprint") or "N/A")
+                short_fp = fp if len(fp) <= 24 else f"{fp[:12]}…{fp[-8:]}"
+                lines.append(
+                    f"• {html.escape(label)} — <code>{other_uid}</code>"
+                    f" | FP <code>{html.escape(short_fp)}</code>"
+                    f" | {html.escape(str(row.get('decision') or 'N/A'))}"
+                )
+        else:
+            lines.append("• None detected")
+    else:
+        lines += ["", "ℹ️ <b>No completed Mini App verification event found.</b>"]
+
+    if pending_rows:
+        lines += ["", "🏷️ <b>Protected Group Records</b>"]
+        shown = 0
+        seen_groups = set()
+        group_docs = {
+            int(row.get("chat_id")): row
+            for row in await get_verification_groups()
+            if row.get("chat_id") is not None
+        }
+
+        for pending in pending_rows:
+            gid = int(pending.get("group_id", 0) or 0)
+            if not gid or gid in seen_groups:
+                continue
+            seen_groups.add(gid)
+            shown += 1
+
+            title = (group_docs.get(gid) or {}).get("title") or pending.get("group_title") or str(gid)
+            status = str(pending.get("status") or "unknown")
+            live_status = "unknown"
+            try:
+                member = await bot.get_chat_member(gid, uid)
+                member_status = getattr(member, "status", None)
+                live_status = getattr(member_status, "value", None) or str(member_status or "unknown")
+            except Exception:
+                # Not a current member / inaccessible / never admitted.
+                live_status = "not member or unavailable"
+
+            lines.append(
+                f"• <b>{html.escape(str(title))}</b> (<code>{gid}</code>)\n"
+                f"  DB: <code>{html.escape(status)}</code> | Telegram: <code>{html.escape(live_status)}</code>"
+            )
+            if shown >= 25:
+                remaining = len(seen_groups) - shown
+                if remaining > 0:
+                    lines.append(f"• …and {remaining} more")
+                break
+    else:
+        lines += ["", "🏷️ <b>No protected-group verification records found.</b>"]
+
+    if events:
+        lines += ["", "🕘 <b>Recent Verification History</b>"]
+        for event in events[:5]:
+            gid = int(event.get("target_group_id", 0) or 0)
+            decision = str(event.get("decision") or "N/A")
+            created = _info_dt(event.get("created_at"))
+            lines.append(
+                f"• <code>{gid}</code> — {html.escape(decision)} — {html.escape(created)}"
+            )
+
+    await _send_html_chunks(message, "\n".join(lines))
 
 
 @bot.on_message(filters.command("addexception") & filters.user(OWNER_ID))
@@ -543,9 +803,43 @@ async def add_exception_cmd(_, message: Message):
         }},
         upsert=True,
     )
+
+    # If this user had already been restricted by the unverified-message guard,
+    # clear that restriction immediately across protected groups.
+    unmuted_groups = 0
+    pending_rows = await verification_pending.find(
+        {"user_id": uid, "muted_unverified": True}
+    ).to_list(length=200)
+    for row in pending_rows:
+        gid = int(row.get("group_id", 0) or 0)
+        if not gid:
+            continue
+        try:
+            if await fully_unmute_member(gid, uid):
+                unmuted_groups += 1
+        except Exception as e:
+            logger.debug("Could not clear exception-user restriction for %s in %s: %s", uid, gid, e)
+
+        # Remove an old verification-guard prompt if one was posted in the group.
+        try:
+            await delete_group_verification_prompt(row)
+        except Exception as e:
+            logger.debug("Could not clear exception-user verification prompt for %s in %s: %s", uid, gid, e)
+
+        await verification_pending.update_one(
+            {"_id": row["_id"]},
+            {"$set": {
+                "muted_unverified": False,
+                "exception_guard_bypass": True,
+                "exception_guard_bypass_at": datetime.now(),
+            }},
+        )
+
+    note = f"\n✅ Group restriction cleared in {unmuted_groups} group(s)." if unmuted_groups else ""
     await message.reply_text(
         f"✅ Exception added for **{user_display(user)}** — `{uid}`.\n"
-        "Verification remains compulsory; anti-fraud device/IP checks are skipped."
+        "Verification remains available, but this user will not be muted or have messages removed by the group guard."
+        + note
     )
 
 
@@ -714,6 +1008,26 @@ async def guard_unverified_group_member(_, message: Message):
     pending = await verification_pending.find_one({"group_id": gid, "user_id": uid})
     if not pending:
         return
+
+    # Exception users are never muted and their group messages are never deleted.
+    # They may still complete the normal verification flow for join approval, but
+    # this guard must not restrict them after an admin has admitted them.
+    exception = await verification_exceptions.find_one(
+        {"user_id": uid, "enabled": {"$ne": False}}
+    )
+    if exception:
+        if pending.get("muted_unverified"):
+            await fully_unmute_member(gid, uid)
+            await verification_pending.update_one(
+                {"_id": pending["_id"]},
+                {"$set": {
+                    "muted_unverified": False,
+                    "exception_guard_bypass": True,
+                    "exception_guard_bypass_at": datetime.now(),
+                }},
+            )
+        return
+
     status = str(pending.get("status") or "pending")
     if status in VERIFIED_PENDING_STATUSES or status.startswith("banned") or status.startswith("auto_banned"):
         return
@@ -877,7 +1191,7 @@ async def manual_ip_review(_, query: CallbackQuery):
         await delete_group_verification_prompt(pending)
         new_status = "approved_manual_ip_review"
         action_name = "manual_approve_same_ip"
-        result_text = "✅ Manually approved after same-IP review." + (" User unmuted." if unmuted else "")
+        result_text = "✅ Manually approved after network review." + (" User unmuted." if unmuted else "")
     else:
         try:
             try:
@@ -890,7 +1204,7 @@ async def manual_ip_review(_, query: CallbackQuery):
             return
         new_status = "banned_manual_ip_review"
         action_name = "manual_ban_same_ip"
-        result_text = "🚫 Manually banned after same-IP review."
+        result_text = "🚫 Manually banned after network review."
 
     await verification_pending.update_one(
         {"_id": pending["_id"], "status": "manual_review_ip"},

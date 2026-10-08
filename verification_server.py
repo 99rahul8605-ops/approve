@@ -680,16 +680,16 @@ def notify_high_risk(current_doc: dict, match: dict, ban_results: list):
         "<b>Current user</b>\n"
         f"👤 {h(cur_user_label)}\n"
         f"🆔 <code>{current_doc['telegram_user_id']}</code>\n"
-        f"🌐 IP: <code>{h(current_doc.get('ip') or 'N/A')}</code>\n"
+        f"🌐 Network ID: <code>{h(current_doc.get('ip') or 'N/A')}</code>\n"
         f"📍 Approx: {h(location_text(current_doc))}\n"
-        f"🧩 Fingerprint: <code>{h(short_fp(current_doc.get('fingerprint')))}</code>\n\n"
+        f"🧩 Device ID: <code>{h(short_fp(current_doc.get('fingerprint')))}</code>\n\n"
 
         "<b>Matched banned user</b>\n"
         f"👤 {h(old_user_label)}\n"
         f"🆔 <code>{old.get('telegram_user_id')}</code>\n"
-        f"🌐 IP: <code>{h(old.get('ip') or 'N/A')}</code>\n"
+        f"🌐 Network ID: <code>{h(old.get('ip') or 'N/A')}</code>\n"
         f"📍 Approx: {h(location_text(old))}\n"
-        f"🧩 Fingerprint: <code>{h(short_fp(old.get('fingerprint')))}</code>\n"
+        f"🧩 Device ID: <code>{h(short_fp(old.get('fingerprint')))}</code>\n"
         f"🚫 Banned in group: <code>{match['group_id']}</code>\n\n"
 
         "<b>Automatic action</b>\n"
@@ -713,9 +713,9 @@ def format_verification_identity_details(doc: dict, *, include_ban_group: bool =
     lines = [
         f"👤 {h(label)}",
         f"🆔 <code>{int(doc.get('telegram_user_id', 0) or 0)}</code>",
-        f"🌐 IP: <code>{h(ip)}</code>",
+        f"🌐 Network ID: <code>{h(ip)}</code>",
         f"📍 Approx: {h(location_text(doc))}",
-        f"🧩 Fingerprint: <code>{h(fingerprint)}</code>",
+        f"🧩 Device ID: <code>{h(fingerprint)}</code>",
     ]
 
     # Device/browser signals help the admin compare two same-IP users.
@@ -762,12 +762,12 @@ def notify_same_ip_autoban(current_doc: dict, ip_matches: list, ban_result: dict
     )
 
     text = (
-        "🚫 <b>Same-IP Auto-Ban Alert</b>\n\n"
+        "🚫 <b>Network Match Auto-Ban Alert</b>\n\n"
         f"<b>Group:</b> {h(group_name)} (<code>{group_id}</code>)\n\n"
         "<b>Current user</b>\n"
         + format_verification_identity_details(current_doc)
         + "\n\n"
-        f"<b>Banned IDs linked to this IP:</b> {len(ip_matches)}\n\n"
+        f"<b>Banned linked IDs:</b> {len(ip_matches)}\n\n"
         + ("\n\n".join(matched_blocks) if matched_blocks else "None")
         + "\n\n<b>Decision:</b> Same-IP Auto Ban is ON and at least one linked ID is currently banned in this same group.\n"
         + action_text
@@ -783,19 +783,19 @@ def notify_same_ip_review(current_doc: dict, ip_matches: list, event_id):
     matched_blocks = []
     for idx, old in enumerate(ip_matches[:8], start=1):
         matched_blocks.append(
-            f"<b>Other ID on same IP #{idx}</b>\n"
+            f"<b>Related ID #{idx}</b>\n"
             + format_verification_identity_details(old)
         )
 
     text = (
-        "⚠️ <b>Same-IP Verification Alert</b>\n\n"
+        "⚠️ <b>Linked Account Verification Alert</b>\n\n"
         f"<b>Group:</b> {h(group_name)} (<code>{group_id}</code>)\n\n"
         "<b>Current user</b>\n"
         + format_verification_identity_details(current_doc)
         + "\n\n"
-        f"<b>Other IDs previously seen on this IP:</b> {len(ip_matches)}\n\n"
+        f"<b>Related IDs found:</b> {len(ip_matches)}\n\n"
         + ("\n\n".join(matched_blocks) if matched_blocks else "None")
-        + "\n\n<b>Decision required:</b> Same IP alone does not auto-ban this user. Compare the details above and choose an action."
+        + "\n\n<b>Decision required:</b> This match alone does not auto-ban the user. Compare the details above and choose an action."
     )
 
     keyboard = {

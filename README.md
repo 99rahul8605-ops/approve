@@ -59,3 +59,8 @@ After successful verification (or manual approval after IP review), the bot now 
 ## One verification per join cycle
 
 A user can complete verification only once for the current active join request. Reopening the same verification page after success returns an “already verified” response and does not create another verification event. If the user leaves a protected group, the completed verification is invalidated; the next join request creates a fresh verification cycle and requires verification again.
+
+
+### Owner user lookup
+- `/info <user_id>` shows Telegram identity, exception status, verification history, latest IP/fingerprint/device data, same-device/same-IP linked IDs, and protected-group status.
+- `/info @username` and reply + `/info` are also supported.
